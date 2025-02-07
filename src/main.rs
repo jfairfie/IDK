@@ -1,11 +1,12 @@
 mod actions;
 
 use std::{fs, iter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
-use egui::{FontDefinitions, Ui};
+use egui::{Color32, FontDefinitions, FontId, TextBuffer, TextEdit, TextFormat, Ui};
+use egui::text::LayoutJob;
 use egui_wgpu_backend::ScreenDescriptor;
 use egui_winit_platform::{Platform, PlatformDescriptor};
 use rfd::FileDialog;
@@ -74,6 +75,8 @@ fn main() {
     let mut open_modal = false;
     let mut search_open = false;
     let mut pressed_timer: u8 = 0;
+    let mut token_text: HashMap<char, HashSet<usize>> = HashMap::new();
+    let mut indexes_set: HashSet<usize> = HashSet::new();
 
     let mut file_state = Mutex::new(FileState::new());
 
@@ -105,11 +108,11 @@ fn main() {
                 let context = platform.context();
 
                 if pressed_keys.len() > 1 && pressed_timer == 4 {
-                    process_multiple_keys(&mut pressed_keys, &mut file_state, &mut text_body, &mut search_open);
+                    process_multiple_keys(&mut pressed_keys, &mut file_state, &mut text_body, &mut search_open, &mut open_modal);
                     pressed_timer = 0;
                 } else if pressed_keys.len() > 1 {
                     pressed_timer += 1;
-                } else if pressed_keys {
+                } else {
                     pressed_timer = 0;
                 }
 
@@ -119,14 +122,30 @@ fn main() {
                         ui.text_edit_singleline(&mut search);
 
                         if search != "" && text_body != "" {
-                            if text_body.contains(search.as_str()) {
-
-                            }
+                            indexes_set = search_token_text(search.clone(), token_text.clone());
                         }
                     }
 
+                    /// TODO - make this more efficient so it doesn't run all the time, only on changes
                     ui.add_space(20.0);
-                    ui.text_edit_multiline(&mut text_body);
+                    let mut job = LayoutJob::default();
+
+                    let mut layout_job = get_text_body(&text_body, &indexes_set, job, &search);
+                    //
+                    // let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
+                    //     layout_job.text = string.to_string();
+                    //     ui.fonts().layout_job(layout_job)
+                    // };
+
+                    ui.add(egui::TextEdit::multiline(&mut text_body).layouter(&mut move |ui, string, wrap_width| {
+                        let mut layout_job = layout_job.clone();
+                        layout_job.text = string.to_string();
+                        ui.fonts().layout_job(layout_job)
+                    }));
+
+                    // ui.text_edit_multiline(&mut text_body);
+
+                    token_text = tokenize_text(text_body.clone());
                 });
 
                 if open_modal {
@@ -134,7 +153,9 @@ fn main() {
                         .collapsible(false)
                         .resizable(false)
                         .show(&context, |ui| {
-                            open_file_modal(ui, &mut open_modal, &mut file_state, &mut text_body);
+                            let text = open_file_modal(ui, &mut open_modal, &mut file_state);
+                            text_body = text;
+                            // token_text = tokenize_text(&mut text_body);
                         });
                 }
 
@@ -217,6 +238,9 @@ fn main() {
                                     VirtualKeyCode::F => {
                                         pressed_keys.remove(&VirtualKeyCode::F);
                                     }
+                                    VirtualKeyCode::O => {
+                                        pressed_keys.remove(&VirtualKeyCode::O);
+                                    }
                                     VirtualKeyCode::LShift => {
                                         pressed_keys.remove(&VirtualKeyCode::LShift);
                                     }
@@ -237,6 +261,9 @@ fn main() {
                                     }
                                     VirtualKeyCode::F => {
                                         pressed_keys.insert(VirtualKeyCode::F);
+                                    }
+                                    VirtualKeyCode::O => {
+                                        pressed_keys.insert(VirtualKeyCode::O);
                                     }
                                     VirtualKeyCode::S => {
                                         pressed_keys.insert(VirtualKeyCode::S);
@@ -272,12 +299,13 @@ fn main() {
     });
 }
 
-fn process_multiple_keys(pressed_keys: &mut HashSet<VirtualKeyCode>, file_state: &mut Mutex<FileState>, text_body: &mut String, search_open: &mut bool) {
-    dbg!("Processing");
+fn process_multiple_keys(pressed_keys: &mut HashSet<VirtualKeyCode>, file_state: &mut Mutex<FileState>, text_body: &mut String, search_open: &mut bool, open_file_modal_open: &mut bool) {
     if pressed_keys.contains(&VirtualKeyCode::LWin) && pressed_keys.contains(&VirtualKeyCode::S) {
-        save_current_file(pressed_keys, file_state, text_body);
+        save_current_file(file_state, text_body);
     } else if pressed_keys.contains(&VirtualKeyCode::LWin) && pressed_keys.contains(&VirtualKeyCode::LShift) && pressed_keys.contains(&VirtualKeyCode::F) {
         dbg!("Searching through text");
+    } else if pressed_keys.contains(&VirtualKeyCode::LWin) && pressed_keys.contains(&VirtualKeyCode::O)  {
+        *open_file_modal_open = if *open_file_modal_open { false } else { true };
     } else if pressed_keys.contains(&VirtualKeyCode::LWin) && pressed_keys.contains(&VirtualKeyCode::F)  {
         *search_open = if *search_open { false } else { true };
         // dbg!("Searching within file");
@@ -286,7 +314,51 @@ fn process_multiple_keys(pressed_keys: &mut HashSet<VirtualKeyCode>, file_state:
     pressed_keys.clear();
 }
 
-fn save_current_file(pressed_keys: &mut HashSet<VirtualKeyCode>, file_state: &mut Mutex<FileState>, text_body: &mut String) {
+fn tokenize_text(text: String) -> HashMap<char, HashSet<usize>> {
+    let text = text.as_str();
+    let mut tokens: HashMap<char, HashSet<usize>> = HashMap::new();
+
+     for (index, ch) in text.chars().enumerate() {
+        if tokens.contains_key(&ch) {
+            tokens.get_mut(&ch).expect("Expected to find character in hash map").insert(index);
+        } else {
+            tokens.insert(ch, HashSet::from([index]));
+        }
+    }
+
+    tokens
+}
+
+// Searches through the tokens and returns a hashset of the indexes found
+fn search_token_text(search_text: String, tokens: HashMap<char, HashSet<usize>>) -> HashSet<usize> {
+    let mut indexes: HashSet<usize> = HashSet::new();
+
+    let search_text = search_text.as_str().chars();
+
+    for (index, ch) in search_text.as_str().chars().enumerate() {
+        if index == 0 && !tokens.contains_key(&ch) {
+            return indexes;
+        } else if index == 0 {
+            indexes = tokens.get(&ch).expect("Expected to find token at 0 index").clone();
+        } else {
+            // now check if the rest matches
+            if tokens.contains_key(&ch) {
+                let token = tokens.get(&ch).expect("Expected to find token at 0 index");
+
+                for i in indexes.clone() {
+                    if !token.contains(&(i + index)) {
+                        indexes.remove(&i);
+                    }
+                }
+            }
+        }
+
+    }
+
+    indexes
+}
+
+fn save_current_file(file_state: &mut Mutex<FileState>, text_body: &mut String) {
     dbg!("Saving");
     {
         let state = file_state.lock().unwrap();
@@ -309,8 +381,9 @@ fn save_current_file(pressed_keys: &mut HashSet<VirtualKeyCode>, file_state: &mu
     }
 }
 
-fn open_file_modal(ui: &mut Ui, show_modal: &mut bool, file_state: &mut Mutex<FileState>, text_body: &mut String) {
+fn open_file_modal(ui: &mut Ui, show_modal: &mut bool, file_state: &mut Mutex<FileState>) -> String {
     ui.label("Select file to open...");
+    let mut text_body: String = String::new();
 
     if ui.button("Browser...").clicked() {
         if let Some(path) = FileDialog::new().pick_file() {
@@ -321,7 +394,7 @@ fn open_file_modal(ui: &mut Ui, show_modal: &mut bool, file_state: &mut Mutex<Fi
                         file_state.insert_file(path.to_str().unwrap().to_string());
                     }
 
-                    *text_body = content;
+                    text_body = content;
                 }
                 Err(err) => {
                     eprintln!("Failed to read from file {}", err);
@@ -335,4 +408,42 @@ fn open_file_modal(ui: &mut Ui, show_modal: &mut bool, file_state: &mut Mutex<Fi
     if ui.button("Cancel").clicked() {
         *show_modal = false;
     }
+
+    text_body
+}
+
+fn get_text_body(text_body: &String, highlight_indexes: &HashSet<usize>, mut job: LayoutJob, search_text: &String) -> LayoutJob {
+    let normal_format = TextFormat {
+        color: Color32::WHITE,
+        font_id: FontId::default(),
+        ..Default::default()
+    };
+
+    let highlighted_format = TextFormat {
+        background: Color32::WHITE,
+        font_id: FontId::default(),
+        ..Default::default()
+    };
+
+    let mut found: Option<&usize> = None;
+
+    for (index, ch) in text_body.as_str().chars().enumerate() {
+        if search_text.is_empty() {
+            job.append(ch.to_string().as_str(), 0.0, normal_format.clone());
+        } else {
+            if found.is_none() {
+                found = highlight_indexes.get(&index);
+            } else if found.is_some() && index > found.unwrap() + search_text.len() - 1 {
+                found = highlight_indexes.get(&index);
+            }
+
+            if found.is_some() || found.is_some() && found.unwrap() >= &index && index < found.unwrap() + search_text.len() {
+                job.append(ch.to_string().as_str(), 0.0, highlighted_format.clone());
+            } else {
+                job.append(ch.to_string().as_str(), 0.0, normal_format.clone());
+            }
+        }
+    }
+
+    job
 }
